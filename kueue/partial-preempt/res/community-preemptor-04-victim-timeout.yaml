@@ -1,0 +1,29 @@
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  name: preemptor-victim-raw
+  namespace: default
+  annotations:
+    kueue.x-k8s.io/partial-preemption: "true"
+spec:
+  active: true
+  queueName: lq-preemptor
+  priorityClassRef:
+    group: kueue.x-k8s.io
+    kind: WorkloadPriorityClass
+    name: preemptor-low
+  priority: 0
+  podSets:
+    - name: main
+      count: 5
+      minCount: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: victim
+              image: busybox
+              command: ["sleep", "100000"]
+              resources:
+                requests:
+                  cpu: "1"

@@ -1,0 +1,22 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: multi-reclaimer-01
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: lq-multi-online
+    kueue.x-k8s.io/priority-class: preemptor-high
+spec:
+  parallelism: 5
+  completions: 100
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: reclaimer
+        image: busybox
+        command: ["sleep", "100000"]
+        resources:
+          requests:
+            cpu: "1"

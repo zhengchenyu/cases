@@ -1,0 +1,43 @@
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: default
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: cq-preemptor
+spec:
+  namespaceSelector: {}
+  preemption:
+    reclaimWithinCohort: Never
+    withinClusterQueue: LowerPriority
+  resourceGroups:
+    - coveredResources: [cpu]
+      flavors:
+        - name: default
+          resources:
+            - name: cpu
+              nominalQuota: "8"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: lq-preemptor
+  namespace: default
+spec:
+  clusterQueue: cq-preemptor
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: preemptor-low
+value: 0
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: preemptor-high
+value: 1000
