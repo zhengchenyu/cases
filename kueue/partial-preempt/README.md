@@ -23,7 +23,7 @@ helm -n kueue-system upgrade --install kueue "$(ls -t bin/kueue-0*.tgz | head -n
   --set 'controllerManager.featureGates[3].enabled=true'
 
 # 3 update config and restart
-kubectl edit cm -n kueue-system kueue-manager-config`, add to `controller_manager_config.yaml
+kubectl edit cm -n kueue-system kueue-manager-config
 ## add config to controller_manager_config.yaml
 ## partialPreemption:
 ##  enableOnDemandPreemption: true
