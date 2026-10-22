@@ -4,28 +4,33 @@ When a high-priority job needs quota, Kueue does not fully evict a low-priority 
 
 ## Setup
 
-Kueue controller-manager feature gates:
-
 ```
---feature-gates=PartialPreemption=true,ElasticJobsViaWorkloadSlices=true,PartialAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true
-```
+## 1 build image
+GIT_TAG=$(git describe --tags --always --dirty)
+make image-build  PLATFORMS=linux/amd64  GIT_TAG=${GIT_TAG}
 
-Manager config (`kubectl edit cm -n kueue-system kueue-manager-config`, add to `controller_manager_config.yaml`):
+# 2 build chart package and install
+make helm-chart-package GIT_TAG=${GIT_TAG}
+helm -n kueue-system upgrade --install kueue "$(ls -t bin/kueue-0*.tgz | head -n 1)" \
+  --create-namespace \
+  --set 'controllerManager.featureGates[0].name=PartialPreemption' \
+  --set 'controllerManager.featureGates[0].enabled=true' \
+  --set 'controllerManager.featureGates[1].name=ElasticJobsViaWorkloadSlices' \
+  --set 'controllerManager.featureGates[1].enabled=true' \
+  --set 'controllerManager.featureGates[2].name=PartialAdmission' \
+  --set 'controllerManager.featureGates[2].enabled=true' \
+  --set 'controllerManager.featureGates[3].name=ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp' \
+  --set 'controllerManager.featureGates[3].enabled=true'
 
-```yaml
-partialPreemption:
-  enableOnDemandPreemption: true
-  timeout: 30s
-```
-
-Restart the manager after changing the config:
-
-```bash
+# 3 update config and restart
+kubectl edit cm -n kueue-system kueue-manager-config`, add to `controller_manager_config.yaml
+## add config to controller_manager_config.yaml
+## partialPreemption:
+##  enableOnDemandPreemption: true
+##  timeout: 30s
 kubectl rollout restart deployment kueue-controller-manager -n kueue-system \
   && kubectl rollout status deployment kueue-controller-manager -n kueue-system
 ```
-
-All cases use this config (on-demand mode).
 
 ---
 
@@ -47,9 +52,12 @@ kubectl apply -f res/community-preemptor-03-preemptor.yaml
 # 4. the preemptor is admitted, which means partial preemption worked
 kubectl wait job/preemptor-high --for=jsonpath='{.status.active}'=4 --timeout=300s
 
-# 5. check how the victim was scaled down
-kubectl get job preemptor-victim -n default \
-  -o jsonpath='parallelism={.spec.parallelism} suspend={.spec.suspend}{"\n"}'
+# 5. check
+kubectl get job preemptor-victim preemptor-high -n default \
+  -o jsonpath='{range .items[*]}{.metadata.name}{" parallelism="}{.spec.parallelism}{" suspend="}{.spec.suspend}{"\n"}{end}'
+## expected:
+## preemptor-victim parallelism=4 suspend=false
+## preemptor-high parallelism=4 suspend=false
 
 # 6. clean up
 kubectl delete -f res/community-preemptor-03-preemptor.yaml
@@ -82,13 +90,29 @@ kubectl wait job/multi-reclaimer-01 --for=jsonpath='{.status.active}'=5 --timeou
 kubectl get job multi-victim-low multi-victim-demand -n default \
   -o jsonpath='{range .items[*]}{.metadata.name}{" parallelism="}{.spec.parallelism}{" suspend="}{.spec.suspend}{"\n"}{end}'
 
-# 5. round 2: preemptor needs another 3 CPU
+# 5. check
+kubectl get job multi-victim-low multi-victim-demand multi-reclaimer-01 -n default \
+  -o jsonpath='{range .items[*]}{.metadata.name}{" parallelism="}{.spec.parallelism}{" suspend="}{.spec.suspend}{"\n"}{end}'
+## expected:
+## multi-victim-low parallelism=2 suspend=false
+## multi-victim-demand parallelism=5 suspend=false
+## multi-reclaimer-01 parallelism=5 suspend=false
+
+# 6. round 2: preemptor needs another 3 CPU
 kubectl apply -f res/community-preemptor-10-reclaimer-02.yaml
 kubectl wait job/multi-reclaimer-02 --for=jsonpath='{.status.active}'=3 --timeout=300s
-kubectl get job multi-victim-low multi-victim-demand -n default \
-  -o jsonpath='{range .items[*]}{.metadata.name}{" parallelism="}{.spec.parallelism}{" suspend="}{.spec.suspend}{"\n"}{end}'
 
-# 6. clean up
+
+# 7. check
+kubectl get job multi-victim-low multi-victim-demand multi-reclaimer-01 multi-reclaimer-02 -n default \
+  -o jsonpath='{range .items[*]}{.metadata.name}{" parallelism="}{.spec.parallelism}{" suspend="}{.spec.suspend}{"\n"}{end}'
+## expected:
+## multi-victim-low parallelism=2 suspend=true
+## multi-victim-demand parallelism=4 suspend=false
+## multi-reclaimer-01 parallelism=5 suspend=false
+## multi-reclaimer-02 parallelism=3 suspend=false
+
+# 8. clean up
 kubectl delete -f res/community-preemptor-10-reclaimer-02.yaml
 kubectl delete -f res/community-preemptor-09-reclaimer-01.yaml
 kubectl delete -f res/community-preemptor-08-victim-demand.yaml
@@ -122,9 +146,13 @@ kubectl wait job/gradual-victim-02 --for=jsonpath='{.status.active}'=6 --timeout
 kubectl apply -f res/community-preemptor-13-reclaimer-gradual.yaml
 
 # 4. the preemptor is admitted; check the final victim counts
-kubectl wait --for=condition=Available job/gradual-reclaimer -n default --timeout=5m
-kubectl get job gradual-victim-01 gradual-victim-02 -n default \
+kubectl wait job/gradual-reclaimer --for=jsonpath='{.status.active}'=5 --timeout=300s
+kubectl get job gradual-victim-01 gradual-victim-02 gradual-reclaimer -n default \
   -o jsonpath='{range .items[*]}{.metadata.name}{" parallelism="}{.spec.parallelism}{" suspend="}{.spec.suspend}{"\n"}{end}'
+## expected:
+## gradual-victim-01 parallelism=4 suspend=false
+## gradual-victim-02 parallelism=3 suspend=false
+## gradual-reclaimer parallelism=5 suspend=false
 
 # 5. clean up
 kubectl delete -f res/community-preemptor-13-reclaimer-gradual.yaml
@@ -154,6 +182,8 @@ kubectl apply -f res/community-preemptor-03-preemptor.yaml
 # 4. first scheduling: the victim gets a reclaimTargetCount, but nothing responds, so count stays 5
 kubectl get workload preemptor-victim-raw -n default \
   -o jsonpath='reclaimTargetCount={.status.admission.podSetAssignments[0].reclaimTargetCount} count={.spec.podSets[0].count}{"\n"}'
+## expected:
+## reclaimTargetCount=4 count=5
 
 # 5. wait past the timeout (30s)
 sleep 40
@@ -161,6 +191,8 @@ sleep 40
 # 6. the next scheduling round falls back to full eviction: the scheduler sets Evicted/Preempted on the victim
 kubectl get workload preemptor-victim-raw -n default \
   -o jsonpath='evicted={.status.conditions[?(@.type=="Evicted")].status} preempted={.status.conditions[?(@.type=="Preempted")].status}{"\n"}'
+## expected:
+## evicted=True preempted=True
 
 # 7. verify the full chain "partial preempt first, then fall back to full eviction" via events
 kubectl get events -n default \
