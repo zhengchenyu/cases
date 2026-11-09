@@ -1,6 +1,6 @@
 # Kueue Partial Preemption Cases
 
-When a high-priority job needs quota, Kueue does not fully evict a low-priority elastic job. Instead it scales one PodSet down toward its `minCount` and reclaims only the replicas it needs. The four cases below verify this behavior.
+When a high-priority job needs quota, Kueue reclaims it from lower-priority elastic jobs in stages: first it scales all low-tier victims down toward their `minCount`, then it fully evicts the low tier (newest first), and only then it takes the above-`minCount` replicas of the higher-tier elastic victim. The cases below verify this behavior.
 
 ## Setup
 
@@ -17,194 +17,128 @@ helm -n kueue-system upgrade --install kueue "$(ls -t bin/kueue-0*.tgz | head -n
   --set 'controllerManager.featureGates[0].enabled=true' \
   --set 'controllerManager.featureGates[1].name=ElasticJobsViaWorkloadSlices' \
   --set 'controllerManager.featureGates[1].enabled=true' \
-  --set 'controllerManager.featureGates[2].name=PartialAdmission' \
-  --set 'controllerManager.featureGates[2].enabled=true' \
-  --set 'controllerManager.featureGates[3].name=ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp' \
-  --set 'controllerManager.featureGates[3].enabled=true'
-
-# 3 update config and restart
-kubectl edit cm -n kueue-system kueue-manager-config
-## add config to controller_manager_config.yaml
-## partialPreemption:
-##  enableOnDemandPreemption: true
-##  timeout: 30s
-kubectl rollout restart deployment kueue-controller-manager -n kueue-system \
-  && kubectl rollout status deployment kueue-controller-manager -n kueue-system
+  --set 'controllerManager.featureGates[2].name=ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp' \
+  --set 'controllerManager.featureGates[2].enabled=true'
 ```
 
 ---
 
-## Case 1: single victim partial preemption
+## Case 1: multiple victims, partial preemption with fallback to full eviction
 
-Victim has 5 replicas / minCount 1. Preemptor needs 4 CPU.
+Three elastic victims fill the 12 CPU cohort: low-01 (count=4, minCount=2) and low-02 (count=4, minCount=2, created after low-01) form the low tier (both in cq-multi-batch, nominal 3), mid-01 (count=4, minCount=2) is the higher tier (also in cq-multi-batch). The three preemptors all run in cq-multi-online (nominal 9). Then three preemptors arrive one by one and leave again: preemptor-01 (2 CPU), preemptor-02 (3 CPU), preemptor-03 (4 CPU).
 
-```bash
-# 1. apply the cluster (cq-preemptor with 8 CPU)
-kubectl apply -f res/community-preemptor-01-cluster.yaml
+Reclaim logic under test: when a preemptor needs quota, Kueue first takes the low-tier victims down to their `minCount`, then fully evicts the low tier (newest first), and only then takes the above-`minCount` replicas of the higher-tier victim. mid-01's above-`minCount` part is never touched while low-tier capacity is left. Replicas shed beyond what the preemptor needs are filled back afterwards (see step 2).
 
-# 2. start the victim (uses 5 CPU)
-kubectl apply -f res/community-preemptor-02-victim.yaml
-kubectl wait job/preemptor-victim --for=jsonpath='{.status.active}'=5 --timeout=300s
-
-# 3. submit the high-priority preemptor (needs 4 CPU)
-kubectl apply -f res/community-preemptor-03-preemptor.yaml
-
-# 4. the preemptor is admitted, which means partial preemption worked
-kubectl wait job/preemptor-high --for=jsonpath='{.status.active}'=4 --timeout=300s
-
-# 5. check
-kubectl get job preemptor-victim preemptor-high -n default \
-  -o jsonpath='{range .items[*]}{.metadata.name}{" parallelism="}{.spec.parallelism}{" suspend="}{.spec.suspend}{"\n"}{end}'
-## expected:
-## preemptor-victim parallelism=4 suspend=false
-## preemptor-high parallelism=4 suspend=false
-
-# 6. clean up
-kubectl delete -f res/community-preemptor-03-preemptor.yaml
-kubectl delete -f res/community-preemptor-02-victim.yaml
-```
-
-**Expected:** the preemptor is admitted; the victim is not suspended, and its parallelism goes from 5 to 4 (on-demand mode reclaims only the 1 replica it needs).
-
----
-
-## Case 2: multiple victims, partial preemption with fallback to full eviction
-
-Two victims with different priorities, each 6 replicas / minCount 2, together using 12 CPU.
+The checks below run after the preemptor is admitted.
 
 ```bash
-# 1. apply the cluster (12 CPU cohort, with low/mid/high priority classes)
-kubectl apply -f res/community-preemptor-06-multi-cluster.yaml
+# 1. apply the cluster (12 CPU cohort: cq-multi-batch nominal 3 + cq-multi-online nominal 9, cohort "multi")
+kubectl apply -f res/partial-preemption-multi-cluster.yaml
 
-# 2. start the low-priority victim (uses 6 CPU)
-kubectl apply -f res/community-preemptor-07-victim-low.yaml
-kubectl wait job/multi-victim-low --for=jsonpath='{.status.active}'=6 --timeout=300s
+# 2. start the victims (12 CPU total, all in cq-multi-batch). low-02 must be created after low-01:
+#    the full-eviction order depends on it.
+kubectl apply -f res/partial-preemption-low-01.yaml
+kubectl wait job/low-01 --for=jsonpath='{.status.active}'=4 --timeout=300s
+kubectl apply -f res/partial-preemption-low-02.yaml
+kubectl wait job/low-02 --for=jsonpath='{.status.active}'=4 --timeout=300s
+kubectl apply -f res/partial-preemption-mid-01.yaml
+kubectl wait job/mid-01 --for=jsonpath='{.status.active}'=4 --timeout=300s
 
-# 3. start the higher-priority victim (both victims now use 12 CPU)
-kubectl apply -f res/community-preemptor-08-victim-demand.yaml
-kubectl wait job/multi-victim-demand --for=jsonpath='{.status.active}'=6 --timeout=300s
-
-# 4. round 1: preemptor needs 5 CPU
-kubectl apply -f res/community-preemptor-09-reclaimer-01.yaml
-kubectl wait job/multi-reclaimer-01 --for=jsonpath='{.status.active}'=5 --timeout=300s
-kubectl get job multi-victim-low multi-victim-demand -n default \
-  -o jsonpath='{range .items[*]}{.metadata.name}{" parallelism="}{.spec.parallelism}{" suspend="}{.spec.suspend}{"\n"}{end}'
-
-# 5. check
-kubectl get job multi-victim-low multi-victim-demand multi-reclaimer-01 -n default \
-  -o jsonpath='{range .items[*]}{.metadata.name}{" parallelism="}{.spec.parallelism}{" suspend="}{.spec.suspend}{"\n"}{end}'
+## check (admit is workload-level, suspend is job-level; joined by job owner).
+## An elastic job can own multiple workload slices (an admitted slice plus an
+## unadmitted scale-up slice), so the awk keeps the largest admitted count per
+## owner and skips slices that carry no admission.
+awk -F'\t' 'NR==FNR{if($2!=""&&$2+0>a[$1]+0)a[$1]=$2; next} {print $1" admit="(($1 in a)?a[$1]:"null")" suspend="$2}' \
+  <(kubectl get workload -n default -o jsonpath='{range .items[*]}{.metadata.ownerReferences[0].name}{"\t"}{.status.admission.podSetAssignments[0].count}{"\n"}{end}') \
+  <(kubectl get job low-01 low-02 mid-01 -n default -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.suspend}{"\n"}{end}')
 ## expected:
-## multi-victim-low parallelism=2 suspend=false
-## multi-victim-demand parallelism=5 suspend=false
-## multi-reclaimer-01 parallelism=5 suspend=false
+## low-01 admit=4 suspend=false
+## low-02 admit=4 suspend=false
+## mid-01 admit=4 suspend=false
 
-# 6. round 2: preemptor needs another 3 CPU
-kubectl apply -f res/community-preemptor-10-reclaimer-02.yaml
-kubectl wait job/multi-reclaimer-02 --for=jsonpath='{.status.active}'=3 --timeout=300s
-
-
-# 7. check
-kubectl get job multi-victim-low multi-victim-demand multi-reclaimer-01 multi-reclaimer-02 -n default \
-  -o jsonpath='{range .items[*]}{.metadata.name}{" parallelism="}{.spec.parallelism}{" suspend="}{.spec.suspend}{"\n"}{end}'
+# 3. step 1: preemptor-01 needs 2 CPU
+kubectl apply -f res/partial-preemption-preemptor-01.yaml
+kubectl wait job/preemptor-01 --for=jsonpath='{.status.active}'=2 --timeout=300s
+awk -F'\t' 'NR==FNR{if($2!=""&&$2+0>a[$1]+0)a[$1]=$2; next} {print $1" admit="(($1 in a)?a[$1]:"null")" suspend="$2}' \
+  <(kubectl get workload -n default -o jsonpath='{range .items[*]}{.metadata.ownerReferences[0].name}{"\t"}{.status.admission.podSetAssignments[0].count}{"\n"}{end}') \
+  <(kubectl get job low-01 low-02 mid-01 preemptor-01 -n default -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.suspend}{"\n"}{end}')
 ## expected:
-## multi-victim-low parallelism=2 suspend=true
-## multi-victim-demand parallelism=4 suspend=false
-## multi-reclaimer-01 parallelism=5 suspend=false
-## multi-reclaimer-02 parallelism=3 suspend=false
+## low-01 admit=3 suspend=false
+## low-02 admit=3 suspend=false
+## mid-01 admit=4 suspend=false
+## preemptor-01 admit=2 suspend=false
+## the 2 reclaimed replicas come from the low tier only, spread evenly (low-01 and low-02
+## each give 1: 4→3). mid-01 is untouched.
+## this step is a pure shrink: each low job has 1 SchedulingGated pod — the shed replica is
+## recreated by the Job controller but kept gated (parallelism stays 4).
+
+# 4. step 2: preemptor-02 needs 3 CPU
+kubectl apply -f res/partial-preemption-preemptor-02.yaml
+kubectl wait job/preemptor-02 --for=jsonpath='{.status.active}'=3 --timeout=300s
+awk -F'\t' 'NR==FNR{if($2!=""&&$2+0>a[$1]+0)a[$1]=$2; next} {print $1" admit="(($1 in a)?a[$1]:"null")" suspend="$2}' \
+  <(kubectl get workload -n default -o jsonpath='{range .items[*]}{.metadata.ownerReferences[0].name}{"\t"}{.status.admission.podSetAssignments[0].count}{"\n"}{end}') \
+  <(kubectl get job low-01 low-02 mid-01 preemptor-01 preemptor-02 -n default -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.suspend}{"\n"}{end}')
+## expected:
+## low-01 admit=3 suspend=false
+## low-02 admit=null suspend=true
+## mid-01 admit=4 suspend=false
+## preemptor-01 admit=2 suspend=false
+## preemptor-02 admit=3 suspend=false
+## low-02 (created later) is squeezed to minCount first (3→2), then low-01 (3→2); still
+## 1 CPU short → low-02 is fully evicted (2→0). That over-releases 1 CPU, which is filled
+## back to low-01 (2→3). mid-01 is untouched.
+
+# 5. step 3: preemptor-03 needs 4 CPU
+kubectl apply -f res/partial-preemption-preemptor-03.yaml
+kubectl wait job/preemptor-03 --for=jsonpath='{.status.active}'=4 --timeout=300s
+awk -F'\t' 'NR==FNR{if($2!=""&&$2+0>a[$1]+0)a[$1]=$2; next} {print $1" admit="(($1 in a)?a[$1]:"null")" suspend="$2}' \
+  <(kubectl get workload -n default -o jsonpath='{range .items[*]}{.metadata.ownerReferences[0].name}{"\t"}{.status.admission.podSetAssignments[0].count}{"\n"}{end}') \
+  <(kubectl get job low-01 low-02 mid-01 preemptor-01 preemptor-02 preemptor-03 -n default -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.suspend}{"\n"}{end}')
+## expected:
+## low-01 admit=null suspend=true
+## low-02 admit=null suspend=true
+## mid-01 admit=3 suspend=false
+## preemptor-01 admit=2 suspend=false
+## preemptor-02 admit=3 suspend=false
+## preemptor-03 admit=4 suspend=false
+## low-01 still holds 1 replica above minCount: it is taken first (3→2), then low-01 is
+## fully evicted (2→0). Still 1 CPU short — only now the higher tier is touched: mid-01
+## gives 1 (4→3).
+## mid-01 gets 1 SchedulingGated pod for its shed replica (3 running + 1 gated).
+
+# 6. step 4: delete preemptor-03, it releases 4 CPU
+kubectl delete -f res/partial-preemption-preemptor-03.yaml
+kubectl wait job/mid-01 --for=jsonpath='{.status.active}'=4 --timeout=300s
+awk -F'\t' 'NR==FNR{if($2!=""&&$2+0>a[$1]+0)a[$1]=$2; next} {print $1" admit="(($1 in a)?a[$1]:"null")" suspend="$2}' \
+  <(kubectl get workload -n default -o jsonpath='{range .items[*]}{.metadata.ownerReferences[0].name}{"\t"}{.status.admission.podSetAssignments[0].count}{"\n"}{end}') \
+  <(kubectl get job low-01 low-02 mid-01 preemptor-01 preemptor-02 -n default -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.suspend}{"\n"}{end}')
+## expected:
+## low-01 admit=null suspend=true
+## low-02 admit=null suspend=true
+## mid-01 admit=4 suspend=false
+## preemptor-01 admit=2 suspend=false
+## preemptor-02 admit=3 suspend=false
+## mid-01 has the higher priority and takes 1 CPU first (3→4), ungating its SchedulingGated
+## pod. The remaining 3 CPU cannot admit either low job: partial admission is not enabled,
+## so both low workloads stay suspended (each needs its full count of 4).
+
+# 7. step 5: delete preemptor-02 and preemptor-01, all three victims restore to 4
+kubectl delete -f res/partial-preemption-preemptor-02.yaml
+kubectl delete -f res/partial-preemption-preemptor-01.yaml
+kubectl wait job/low-01 job/low-02 --for=jsonpath='{.status.active}'=4 --timeout=300s
+awk -F'\t' 'NR==FNR{if($2!=""&&$2+0>a[$1]+0)a[$1]=$2; next} {print $1" admit="(($1 in a)?a[$1]:"null")" suspend="$2}' \
+  <(kubectl get workload -n default -o jsonpath='{range .items[*]}{.metadata.ownerReferences[0].name}{"\t"}{.status.admission.podSetAssignments[0].count}{"\n"}{end}') \
+  <(kubectl get job low-01 low-02 mid-01 -n default -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.suspend}{"\n"}{end}')
+## expected:
+## low-01 admit=4 suspend=false
+## low-02 admit=4 suspend=false
+## mid-01 admit=4 suspend=false
 
 # 8. clean up
-kubectl delete -f res/community-preemptor-10-reclaimer-02.yaml
-kubectl delete -f res/community-preemptor-09-reclaimer-01.yaml
-kubectl delete -f res/community-preemptor-08-victim-demand.yaml
-kubectl delete -f res/community-preemptor-07-victim-low.yaml
+kubectl delete -f res/partial-preemption-mid-01.yaml
+kubectl delete -f res/partial-preemption-low-02.yaml
+kubectl delete -f res/partial-preemption-low-01.yaml
+kubectl delete -f res/partial-preemption-multi-cluster.yaml
 ```
-
-**Expected:**
-
-| Step | Low-priority victim | Higher-priority victim | Preemptor |
-|---|---|---|---|
-| After round 1 | parallelism 2 (scaled to minCount, not evicted) | parallelism 5 (reclaims only 1) | reclaimer-01 admitted |
-| After round 2 | suspend=true (already at minCount, falls back to full eviction) | parallelism 4 (reclaims only 1) | reclaimer-02 admitted |
 
 ---
-
-## Case 3: multiple victims with a per-round reclaim cap, gradual preemption
-
-Two victims with the same priority, each 6 replicas / minCount 2, both annotated with `partial-preemption-max-reclaimed-count: "2"` (each reclaims at most 2 per round). The preemptor needs 5 CPU, which cannot be freed in one round, so it converges over several rounds.
-
-```bash
-# 1. reuse the Case 2 cluster (re-apply if already cleaned up)
-kubectl apply -f res/community-preemptor-06-multi-cluster.yaml
-
-# 2. admit the two victims in order (a fixed order keeps the result stable)
-kubectl apply -f res/community-preemptor-11-victim-gradual-01.yaml
-kubectl wait job/gradual-victim-01 --for=jsonpath='{.status.active}'=6 --timeout=300s
-kubectl apply -f res/community-preemptor-12-victim-gradual-02.yaml
-kubectl wait job/gradual-victim-02 --for=jsonpath='{.status.active}'=6 --timeout=300s
-
-# 3. submit the high-priority preemptor (needs 5 CPU)
-kubectl apply -f res/community-preemptor-13-reclaimer-gradual.yaml
-
-# 4. the preemptor is admitted; check the final victim counts
-kubectl wait job/gradual-reclaimer --for=jsonpath='{.status.active}'=5 --timeout=300s
-kubectl get job gradual-victim-01 gradual-victim-02 gradual-reclaimer -n default \
-  -o jsonpath='{range .items[*]}{.metadata.name}{" parallelism="}{.spec.parallelism}{" suspend="}{.spec.suspend}{"\n"}{end}'
-## expected:
-## gradual-victim-01 parallelism=4 suspend=false
-## gradual-victim-02 parallelism=3 suspend=false
-## gradual-reclaimer parallelism=5 suspend=false
-
-# 5. clean up
-kubectl delete -f res/community-preemptor-13-reclaimer-gradual.yaml
-kubectl delete -f res/community-preemptor-12-victim-gradual-02.yaml
-kubectl delete -f res/community-preemptor-11-victim-gradual-01.yaml
-```
-
-**Expected:** the preemptor is admitted; one victim ends at parallelism 4 and the other at 3 (final state {3,4}: each reclaims at most 2 per round, and the last round reclaims only 1, so there is no over-reclaim); neither victim is suspended.
-
----
-
-## Case 4: partial target timeout, fallback to full eviction
-
-Create a victim whose `reclaimTargetCount` can never converge, so it times out and falls back to full eviction. The victim is a plain `Workload` (with the partial-preemption annotation and a minCount, but no controller to respond to `reclaimTargetCount`), so it always reaches the timeout.
-
-```bash
-# 1. apply the single-victim cluster
-kubectl apply -f res/community-preemptor-01-cluster.yaml
-
-# 2. create the plain Workload victim (uses 5 CPU) and wait until admitted
-kubectl apply -f res/community-preemptor-04-victim-timeout.yaml
-kubectl wait workload/preemptor-victim-raw -n default --for=condition=Admitted --timeout=2m
-
-# 3. submit the high-priority preemptor (needs 4 CPU)
-kubectl apply -f res/community-preemptor-03-preemptor.yaml
-
-# 4. first scheduling: the victim gets a reclaimTargetCount, but nothing responds, so count stays 5
-kubectl get workload preemptor-victim-raw -n default \
-  -o jsonpath='reclaimTargetCount={.status.admission.podSetAssignments[0].reclaimTargetCount} count={.spec.podSets[0].count}{"\n"}'
-## expected:
-## reclaimTargetCount=4 count=5
-
-# 5. wait past the timeout (30s)
-sleep 40
-
-# 6. the next scheduling round falls back to full eviction: the scheduler sets Evicted/Preempted on the victim
-kubectl get workload preemptor-victim-raw -n default \
-  -o jsonpath='evicted={.status.conditions[?(@.type=="Evicted")].status} preempted={.status.conditions[?(@.type=="Preempted")].status}{"\n"}'
-## expected:
-## evicted=True preempted=True
-
-# 7. verify the full chain "partial preempt first, then fall back to full eviction" via events
-kubectl get events -n default \
-  --field-selector involvedObject.name=preemptor-victim-raw \
-  --sort-by=.lastTimestamp \
-  -o custom-columns=REASON:.reason,MSG:.message
-
-# 8. clean up
-kubectl delete -f res/community-preemptor-03-preemptor.yaml
-kubectl delete -f res/community-preemptor-04-victim-timeout.yaml
-```
-
-**Expected:** the events show `PartiallyPreempted` (scale-down attempted first) followed by `Preempted` (the partial target timed out, so it falls back to full eviction), and the victim conditions are `Evicted=True` and `Preempted=True`. This proves the timeout-then-full-eviction fallback works.
-
-> Note: the victim here is a plain Workload with no parent Job to release its quota, so after it is evicted the quota is not actually freed and the preemptor is not admitted. This case verifies the fallback logic through the event chain, not through preemptor admission. To see the preemptor actually admitted, use a real elastic slice Job as the victim — but then the victim scales down immediately and never stays long enough to hit the timeout.
