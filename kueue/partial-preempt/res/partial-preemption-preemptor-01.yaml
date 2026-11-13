@@ -7,7 +7,7 @@ metadata:
     kueue.x-k8s.io/queue-name: lq-multi-online
     kueue.x-k8s.io/priority-class: preemptor-high
 spec:
-  parallelism: 2
+  parallelism: 5
   completions: 100
   backoffLimit: 0
   template:
