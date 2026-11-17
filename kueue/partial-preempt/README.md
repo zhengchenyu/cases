@@ -27,7 +27,7 @@ helm -n kueue-system upgrade --install kueue "$(ls -t bin/kueue-0*.tgz | head -n
 
 Two elastic victims fill the 12 CPU cohort: low-01 (count=6, minCount=2) and low-02 (count=6, minCount=2, created after low-01), both in cq-multi-batch and at the same priority — so the more recently admitted low-02 is squeezed first and fully evicted first. The two preemptors run in cq-multi-online (nominal 9). Then the two preemptors arrive one by one and leave again: preemptor-01 (5 CPU), preemptor-02 (4 CPU).
 
-The Job integration reads the minimum from `kueue.x-k8s.io/podset-partial-preemption-min-count` on the Job metadata. Keep this exact annotation key in both victim manifests; an unrecognized key leaves the Workload without a partial-preemption minimum, so the scheduler will fully evict it.
+The Job integration reads the minimum from `kueue.x-k8s.io/podset-partial-preemption-min-retained-count` on the Job's PodTemplate (`spec.template.metadata.annotations`). Keep this exact annotation key and location in both victim manifests; an unrecognized key leaves the Workload without a partial-preemption minimum, so the scheduler will fully evict it.
 
 The checks below run after the preemptor is admitted.
 
